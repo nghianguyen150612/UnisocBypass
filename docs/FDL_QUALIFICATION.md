@@ -44,7 +44,7 @@ several categories; none is a conclusive root-cause diagnosis.
 | Explicit loader-format/header mismatch | The log reports a parse/format issue. | It does not prove a candidate has the wrong cryptographic signature unless the tool explicitly reports that check. |
 | Explicit security/authentication rejection | The log contains a direct rejection/verification phrase. | It does not identify which key, policy, stage, or package is responsible without further evidence. |
 | FDL2 initialization failure | The log associates initialization, DRAM, NAND, or storage failure with FDL2. | It does not by itself distinguish incompatible board init, bad transfer, power/transport trouble, or damaged media. |
-| `FDL2: incompatible partition` | `spreadtrum_flash` describes this response as occurring after FDL2 has initialized. | It is not evidence that CHECK_BAUD or FDL2 initialization failed. |
+| `FDL2: incompatible partition` | `spreadtrum_flash` reports this response after sending FDL2's execute command and waiting for its response, i.e. after the FDL2 execution/initialization stage. | It is not a CHECK_BAUD failure or an initialization failure. It does not prove successful UFS access, unrestricted partition access, or overall loader compatibility. |
 
 The classifier intentionally adds `root_cause_undetermined` for CHECK_BAUD
 timeouts and never translates them into authentication failure.
@@ -61,23 +61,66 @@ python3 tools/fdl_qualify.py inventory \
   --settings /mnt/research/cm2-pack/settings.ini --json
 ```
 
-The inventory includes candidate role based on filename, byte size, SHA-256,
-limited header/marker observations, settings references, profile labels found
-in the settings path/content, and known/unknown FDL base addresses. Structural
-heuristics only flag obvious cases such as empty files, text/XML containers,
-or very small images; “opaque binary” is not a positive loader identification.
+The inventory includes candidate role based on filename or a single explicit
+settings reference, byte size, SHA-256, limited header/marker observations,
+settings references, profile labels found in the settings path/content, and
+known/unknown FDL base addresses. It records `evidence_issues` for missing,
+ambiguous, unresolved, contradictory, or multiply assigned references.
+Structural heuristics only flag obvious cases such as empty files, text/XML
+containers, or very small images; “opaque binary” is not a positive loader
+identification.
 
-Compatibility status is deliberately limited:
+Compatibility status requires one complete, unambiguous pair of explicit
+settings references: one FDL1 and one FDL2 reference, each resolving to an
+inventoried file. A generic loader pair inferred only from filenames is
+insufficient. A generic filename can be assigned a stage by explicit settings
+metadata, but an explicit stage that points to a filename labelled as the
+opposite stage is recorded as a role mismatch. Two stages pointing at the same
+file are ambiguous unless separate evidence establishes that layout; this
+tool does not assume it.
 
-* **unverified** — candidate-like FDL1 and FDL2 files are present and no
-  obvious inventory problem blocks inspection. This still means unvalidated.
-* **insufficient evidence** — one/both roles are absent, references are
-  missing/ambiguous, or the settings file is malformed.
-* **structurally incompatible** — a candidate has an obvious non-loader
-  structure such as empty file, text/container content, or implausible size.
+Status precedence is:
+
+1. **structurally incompatible** when a file directly referenced for FDL1 or
+   FDL2 has a definite structural defect. This takes precedence over missing
+   or conflicting references because the required referenced file itself is
+   demonstrably unusable as a loader image. An unrelated plausible candidate
+   cannot mask that defect.
+2. **insufficient evidence** when no required referenced file has a definite
+   structural defect, but settings are malformed or references are missing,
+   partial, ambiguous, contradictory, unresolved, or point to multiple files
+   for one stage. Filename-only candidates also land here.
+3. **unverified** only when a complete, unique, stage-consistent FDL1/FDL2
+   reference pair resolves to inventoried files with no detected structural
+   defect or reference issue. This means there is metadata for further
+   inspection; it does not demonstrate device compatibility.
+
+The three compatibility states are deliberately limited:
+
+* **unverified** — linked metadata and files are sufficient for further
+  inspection, but device compatibility remains unproven.
+* **insufficient evidence** — a complete, unambiguous, stage-consistent
+  settings reference pair is missing.
+* **structurally incompatible** — a required settings-referenced file has an
+  obvious non-loader structure such as empty file, text/container content, or
+  implausible size.
 
 There is no `compatible` status. A report of `unverified` is not authorization
 to test a loader on the phone.
+
+## Remaining limitations
+
+* The INI reader recognizes common FDL1/FDL2 path keys and simple address
+  labels; it is not a complete parser for private CM2SP3 pack formats.
+* Filename role inference is only a consistency check. Explicit settings
+  metadata may assign an otherwise generically named file, but a role mismatch
+  becomes insufficient evidence.
+* Format checks are shallow header/size observations. They do not parse every
+  vendor loader wrapper, authenticate signatures, or prove that an opaque
+  binary is executable by this BootROM.
+* Hashes identify the inspected bytes; they do not prove provenance, approval,
+  successful loading, or compatibility with the device.
+* No FDL has been validated on Z2352N. P002A authorizes no hardware operation.
 
 ## Historical log command
 
@@ -90,8 +133,12 @@ cat ./historical-spd-dump.log | python3 tools/fdl_qualify.py classify-log --json
 
 Possible classifications distinguish transport failures/timeouts,
 CHECK_BAUD timeouts, explicit loader-format reports, explicit
-security/authentication reports, and FDL2 initialization reports. Unknown
-text remains `unclassified`; no diagnostic command is issued to a device.
+security/authentication reports, FDL2 initialization reports, and
+`fdl2_incompatible_partition`. The latter is reported independently and does
+not imply CHECK_BAUD failure, authentication rejection, UFS access, or broad
+partition access. Combined logs can yield multiple independent categories.
+Unknown text remains `unclassified`; no diagnostic command is issued to a
+device.
 
 ## Infinity CM2SP3 profile and boot-pack notes
 
@@ -153,6 +200,11 @@ is uncertain. Disconnect USB if the device behaves unexpectedly. Stop at a
 CHECK_BAUD timeout rather than retrying with a different FDL. Do not infer
 authentication failure from it. No FDL upload/execute or storage operation is
 part of weekend read-only qualification.
+
+P002A authorizes no hardware operations. `unverified` does not mean
+compatible; profile labels and filenames are insufficient to validate a
+loader; a CHECK_BAUD timeout does not prove authentication failure; and no FDL
+has been validated on Z2352N.
 
 ## Sources
 

@@ -10,6 +10,7 @@ import argparse
 import configparser
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -92,7 +93,6 @@ def _parse_ini(path: Path) -> tuple[configparser.ConfigParser | None, list[str],
 
 def _references(
     parser: configparser.ConfigParser | None,
-    text: str,
     loader_dir: Path,
     settings_path: Path,
 ) -> list[dict[str, Any]]:
@@ -106,7 +106,14 @@ def _references(
             value_clean = value.strip().strip("\"'")
             value_path = Path(value_clean.replace("\\", "/"))
             value_role = _role_for_name(value_path.name)
-            is_pathish = bool(value_role) or bool(re.search(r"\.(?:bin|fdl|elf|img|pac)$", value_clean, re.IGNORECASE))
+            has_file_extension = bool(re.search(r"\.(?:bin|fdl|elf|img|pac)$", value_clean, re.IGNORECASE))
+            is_address = bool(ADDRESS.fullmatch(value_clean))
+            is_pathish = bool(value_role or has_file_extension or "/" in value_clean or "\\" in value_clean)
+            metadata_key_is_path = role in {"FDL1", "FDL2"} and (
+                key_l == role.lower() or any(word in key_l for word in ("file", "path", "loader", "image", "bin"))
+            )
+            if metadata_key_is_path and value_clean and not is_address:
+                is_pathish = True
             if role is None and value_role is not None:
                 role = value_role
             if role is None and ("fdl" in key_l or "loader" in key_l) and is_pathish:
@@ -124,12 +131,11 @@ def _references(
                 "key": key,
                 "value": value,
                 "stage": role,
-                "resolved_path": str(resolved),
+                "filename_role": value_role,
+                "resolved_path": os.path.abspath(resolved),
                 "exists": resolved.is_file(),
             })
 
-    # Retain profile/device references as metadata without guessing their meaning.
-    _ = text
     return refs
 
 
@@ -173,15 +179,61 @@ def analyze(loader_dir: Path, settings_path: Path) -> dict[str, Any]:
     else:
         settings_issues.append(f"loader directory does not exist: {loader_dir}")
 
-    references = _references(parser, "", loader_dir, settings_path)
-    # Resolve references to inventory entries and expose a candidate match when unambiguous.
+    references = _references(parser, loader_dir, settings_path)
     inventory_by_abs = {str((loader_dir / item["path"]).resolve()): item for item in files}
     for ref in references:
-        entry = inventory_by_abs.get(str(Path(ref["resolved_path"]).resolve()))
+        referenced_path = Path(ref["resolved_path"])
+        inventory_key = os.path.abspath(referenced_path)
+        entry = inventory_by_abs.get(inventory_key)
+        referenced_inside_loader_dir = referenced_path.is_relative_to(loader_dir)
+        has_symlink_component = False
+        if referenced_inside_loader_dir:
+            component = loader_dir
+            for part in referenced_path.relative_to(loader_dir).parts:
+                component = component / part
+                if component.is_symlink():
+                    has_symlink_component = True
+                    break
+        if (
+            entry is None
+            and ref["exists"]
+            and loader_dir.is_dir()
+            and not has_symlink_component
+            and referenced_inside_loader_dir
+        ):
+            observations, structural_issue = observe_format(referenced_path)
+            entry = {
+                "path": str(referenced_path.relative_to(loader_dir)),
+                "size_bytes": referenced_path.stat().st_size,
+                "sha256": sha256_file(referenced_path),
+                "candidate_roles": [],
+                "format_observations": observations,
+                "structural_issue": structural_issue,
+            }
+            files.append(entry)
+            inventory_by_abs[inventory_key] = entry
+
         ref["inventory_path"] = entry["path"] if entry else None
         ref["candidate_match"] = bool(entry and ref["stage"] in {"FDL1", "FDL2"})
-        if ref["candidate_match"] and ref["stage"] not in entry["candidate_roles"]:
-            entry["candidate_roles"].append(ref["stage"])
+        ref["role_match"] = bool(
+            ref["candidate_match"]
+            and (ref["filename_role"] is None or ref["filename_role"] == ref["stage"])
+        )
+        ref["structural_issue"] = entry["structural_issue"] if entry else None
+
+    # Infer a role from explicit settings metadata only for a generic filename
+    # referenced by exactly one stage. Never overwrite a contradictory filename.
+    references_by_path: dict[str, list[dict[str, Any]]] = {}
+    for ref in references:
+        if ref["candidate_match"]:
+            references_by_path.setdefault(ref["resolved_path"], []).append(ref)
+    for path_references in references_by_path.values():
+        stages = {ref["stage"] for ref in path_references if ref["stage"] in {"FDL1", "FDL2"}}
+        if len(stages) == 1:
+            ref = next(ref for ref in path_references if ref["stage"] in stages)
+            entry = inventory_by_abs[str(Path(ref["resolved_path"]).resolve())]
+            if ref["filename_role"] is None and next(iter(stages)) not in entry["candidate_roles"]:
+                entry["candidate_roles"].append(next(iter(stages)))
 
     profile_text = " ".join([str(settings_path), str(loader_dir), *[ref["section"] for ref in references]])
     profile_mentions: list[str] = []
@@ -194,16 +246,65 @@ def analyze(loader_dir: Path, settings_path: Path) -> dict[str, Any]:
         if family in profile_text.lower() and model in profile_text.lower() and profile not in profile_mentions:
             profile_mentions.append(profile)
 
-    referenced_missing = any(not ref["exists"] for ref in references)
-    ambiguous = any(ref["stage"] == "ambiguous" for ref in references)
-    malformed = bool(settings_issues)
-    structural_bad = any(item["structural_issue"] for item in files if item["candidate_roles"])
-    has_fdl1 = any("FDL1" in item["candidate_roles"] and not item["structural_issue"] for item in files)
-    has_fdl2 = any("FDL2" in item["candidate_roles"] and not item["structural_issue"] for item in files)
-    linked_roles = {ref["stage"] for ref in references if ref["candidate_match"] and ref["stage"] in {"FDL1", "FDL2"}}
-    if structural_bad and not (has_fdl1 and has_fdl2):
+    evidence_issues: list[dict[str, Any]] = []
+    for issue in settings_issues:
+        evidence_issues.append({"type": "settings_error", "message": issue})
+    for ref in references:
+        if ref["stage"] == "ambiguous":
+            evidence_issues.append({
+                "type": "ambiguous_reference",
+                "section": ref["section"],
+                "key": ref["key"],
+                "value": ref["value"],
+            })
+        elif ref["stage"] in {"FDL1", "FDL2"}:
+            if not ref["exists"]:
+                evidence_issues.append({
+                    "type": "missing_reference_file",
+                    "stage": ref["stage"],
+                    "path": ref["resolved_path"],
+                })
+            elif not ref["candidate_match"]:
+                evidence_issues.append({
+                    "type": "unresolved_reference",
+                    "stage": ref["stage"],
+                    "path": ref["resolved_path"],
+                    "message": "The referenced file is outside the inventoried loader directory or could not be inventoried.",
+                })
+            elif not ref["role_match"]:
+                evidence_issues.append({
+                    "type": "role_mismatch",
+                    "stage": ref["stage"],
+                    "filename_role": ref["filename_role"],
+                    "path": ref["resolved_path"],
+                })
+
+    for stage in ("FDL1", "FDL2"):
+        stage_references = [ref for ref in references if ref["stage"] == stage]
+        target_paths = {ref["resolved_path"] for ref in stage_references if ref["candidate_match"]}
+        if not stage_references:
+            evidence_issues.append({"type": "missing_stage_reference", "stage": stage})
+        elif len(target_paths) > 1:
+            evidence_issues.append({
+                "type": "multiple_files_for_stage",
+                "stage": stage,
+                "paths": sorted(target_paths),
+            })
+
+    for path, path_references in references_by_path.items():
+        stages = sorted({ref["stage"] for ref in path_references if ref["stage"] in {"FDL1", "FDL2"}})
+        if len(stages) > 1:
+            evidence_issues.append({"type": "same_file_for_multiple_stages", "stages": stages, "path": path})
+
+    # A definite defect in an explicitly referenced required file is the only
+    # condition that outranks incomplete or contradictory reference metadata.
+    structurally_invalid_required = any(
+        ref["candidate_match"] and ref["stage"] in {"FDL1", "FDL2"} and ref["structural_issue"]
+        for ref in references
+    )
+    if structurally_invalid_required:
         status = "structurally incompatible"
-    elif malformed or referenced_missing or ambiguous or not (has_fdl1 and has_fdl2) or linked_roles and linked_roles != {"FDL1", "FDL2"}:
+    elif evidence_issues:
         status = "insufficient evidence"
     else:
         status = "unverified"
@@ -215,6 +316,7 @@ def analyze(loader_dir: Path, settings_path: Path) -> dict[str, Any]:
         "settings_ini": str(settings_path),
         "loader_directory": str(loader_dir),
         "settings_issues": settings_issues,
+        "evidence_issues": evidence_issues,
         "profiles_referenced": profile_mentions,
         "files": files,
         "settings_references": references,
@@ -227,6 +329,7 @@ def analyze(loader_dir: Path, settings_path: Path) -> dict[str, Any]:
 CLASSIFICATION_HINTS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("security_or_authentication_rejection", re.compile(r"signature.{0,30}(?:reject|invalid|fail)|auth(?:entication)?\s*(?:reject|fail)|secure boot.{0,30}(?:reject|fail)|verification failed", re.IGNORECASE), "An explicit security/authentication rejection phrase is present."),
     ("loader_format_mismatch", re.compile(r"(?:invalid|unsupported|bad|unknown).{0,24}(?:loader|fdl|image).{0,24}(?:format|header)|(?:format|header).{0,24}(?:invalid|unsupported|bad)", re.IGNORECASE), "The log explicitly mentions an invalid or unsupported loader/image format."),
+    ("fdl2_incompatible_partition", re.compile(r"fdl\s*2\s*:?\s*incompatible\s+partition", re.IGNORECASE), "The log reports FDL2's incompatible-partition response; this does not establish storage access or loader compatibility."),
     ("fdl2_initialization_failure", re.compile(r"fdl\s*2.{0,60}(?:init(?:ializ\w*)?|dram|nand|storage).{0,40}(?:fail|error|timeout)|(?:init(?:ializ\w*)?|dram|nand|storage).{0,40}(?:fail|error|timeout).{0,60}fdl\s*2", re.IGNORECASE), "The log associates an initialization-related failure with FDL2."),
     ("check_baud_timeout", re.compile(r"check[_ ]?baud.{0,80}(?:timeout|timed out|no response|no reply)|(?:timeout|timed out|no response|no reply).{0,80}check[_ ]?baud", re.IGNORECASE), "CHECK_BAUD did not receive an observed response; this alone does not identify why."),
     ("usb_transport_timeout", re.compile(r"(?:usb|libusb|bulk transfer|read|write).{0,60}(?:timeout|timed out)|(?:timeout|timed out).{0,60}(?:usb|libusb|bulk transfer)", re.IGNORECASE), "A USB/read/write timeout is present; this does not identify whether enumeration, cabling, host setup, or device state caused it."),
