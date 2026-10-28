@@ -51,7 +51,7 @@ Then loads each partition and verifies it:
 0xa3b4  ...                            ; success path
 ```
 
-The address `0x5500` is the SRAM address where the BootROM loads SPL's own DHTB image (confirmed from the tool's `spd_dump` command line: `fdl fdl1-dl.bin 0x5500`).
+The `0x5500` address is an observation from this analyzed BootROM path, not a universal FDL address. Consult package-specific metadata; this repository makes no recommendation for using it with an FDL.
 
 ## Error handler at 0x9fb8
 

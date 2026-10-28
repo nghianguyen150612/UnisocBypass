@@ -163,9 +163,9 @@ A sibling entry at `0x107e0c` is used for the "default eMMC FDL1 load"
 path. It does the same `fn_10238c()` call; if it returns 1 it ALSO jumps
 to `0x5500`, otherwise it calls `fn_1042e4` (eMMC loader).
 
-The hardcoded 0x5500 FDL1 entry point matches the public
-`spd_dump exec_addr 0x3ee8 fdl fdl1-dl.bin 0x5500` recipe we already use
-in this repo.
+The hardcoded `0x5500` value is a disassembly observation for this BootROM
+entry path. It is not a general FDL1 load address, and must not be used as a
+loader recommendation for another device or profile.
 
 ## 7. Recovery protocol core - recovery_comms (0x107e4c)
 
