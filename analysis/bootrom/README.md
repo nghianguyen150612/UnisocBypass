@@ -23,25 +23,9 @@ grades at boot is not in any kernel module we've inspected
 or the BootROM itself. Having a copy of the BootROM lets us check
 whether PMIC grade init happens here.
 
-## Dumping from our own device (alternative)
+## Device dump status
 
-If we ever need a fresh dump from our own unit, the recipe is:
-
-1. Power off, hold Volume Down, connect USB - device enters BootROM download mode.
-2. Use `spd_dump` (from [TomKing062/spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash)):
-
-   ```
-   spd_dump --wait 300 exec_addr 0x3ee8 \
-     fdl ../fdl/fdl1-dl.bin 0x5500 \
-     fdl ../fdl/fdl2-dl.bin 0x9efffe00 \
-     exec \
-     read_mem 0x100000 0x12000 bootrom_dump.bin
-   ```
-
-   (`read_mem <base> <size> <outfile>` is an spd_dump command available
-   after FDL2 is loaded. The 0x100000..0x111FFF range is where the
-   BootROM mask-ROM is mapped.)
-
-This has not been executed on this device; the binary above is the
-published public dump, which is byte-identical to what the mask ROM
-would return.
+No device-side dump recipe is included here. BootROM interaction requires an
+externally sourced loader pair and a separate safety review; this repository's
+FDL qualification tool is offline-only. The checked-in mask-ROM analysis and
+dump artifacts are research references, not evidence that an FDL can be used.

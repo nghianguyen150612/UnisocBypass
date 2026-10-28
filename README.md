@@ -84,7 +84,7 @@ adb reboot
 - `docs/` - Detailed analysis documentation
 - `examples/` - Stock and modified images for reference
 - `analysis/` - SPL disassembly + BootROM reverse-engineering notes
-- `fdl/` - Unsigned FDL files for flashing on locked devices via `spd_dump`
+- `fdl/` - Offline FDL qualification tooling notes; no proprietary loaders are distributed
 - `oc/` - separate CPU/GPU overclock research, see [`oc/README.md`](oc/README.md)
 
 ## Documentation index
@@ -134,7 +134,9 @@ the practical performance gain turned out to be small.
 
 ## Prerequisites
 
-You do **not** need an unlocked bootloader. The patched images work on both locked and unlocked devices, though the installation method differs.
+The offline analysis tools do not require an unlocked bootloader. The patching
+and device-side scripts are separate workflows and require the access described
+in their individual documentation.
 
 **Option A - device already has adb root (unlocked or engineering build)**
 
@@ -142,9 +144,13 @@ Use `scripts/flash_spl.sh` and `scripts/flash_uboot.sh`, which write to eMMC via
 
 **Option B - stock locked device**
 
-Use `spd_dump` with the included FDL files in `fdl/`. See `fdl/README.md` for the exact command. No prior unlock is required.
+The repository does not provide FDL binaries or a flashing recipe. The
+offline inventory and diagnostic classifier in
+[`docs/FDL_QUALIFICATION.md`](docs/FDL_QUALIFICATION.md) do not load a device
+or establish loader compatibility.
 
-After the patched SPL + patched uboot are installed (via either method), the device permanently reports as unlocked on every boot, and all downstream signature checks are skipped.
+The FDL qualification work in this repository supplies no locked-device install
+method and makes no claim that a candidate loader will work on a phone.
 
 On first boot after switching from a locked stock state, Android detects the verified-boot-state change (green -> orange) and wipes userdata. This is standard Android behavior, not specific to these patches.
 
@@ -186,13 +192,8 @@ If a patched SPL somehow fails to boot:
 
 1. Power off the device completely
 2. Hold volume down + connect USB to enter download mode
-3. Use `spd_dump` to flash the stock SPL back:
-```bash
-spd_dump --wait 300 exec_addr 0x3ee8 \
-  fdl fdl1-dl.bin 0x5500 \
-  fdl fdl2-dl.bin 0x9efffe00 \
-  exec w splloader stock_spl.img w splloader_bak stock_spl.img poweroff
-```
+3. Recovery through BootROM download mode requires a separately sourced,
+   reviewed recovery method. This repository does not provide FDL binaries.
 
 **Important:** Always keep a stock SPL backup. `scripts/backup.sh` creates one automatically.
 

@@ -1,35 +1,16 @@
-# Unsigned FDL files for locked-device flashing
+# Offline FDL qualification
 
-These two files allow flashing any partition on a **locked** Unisoc UMS512 device via SPD tools (`spd_dump`, SPD Factory, Research Download, UpgradeDownload) without going through BootROM signature verification.
-
-- `fdl1-dl.bin` - unsigned FDL1 (USB download-mode stage 1)
-- `fdl2-dl.bin` - unsigned FDL2 (download protocol handler that writes to eMMC)
-
-## Why they matter for this repo
-
-**You do NOT need an unlocked bootloader to install the patched SPL + uboot from this repo.** The patched images can be flashed onto a fresh, stock, locked device using these FDL files:
+This repository does not distribute FDL binaries. Supply files from a source you
+are authorized to use to the read-only inventory tool; it hashes and inspects
+them locally but never loads them onto a device.
 
 ```bash
-# Enter USB download mode: power off, hold volume down, connect USB
-spd_dump --wait 300 exec_addr 0x3ee8 \
-    fdl fdl1-dl.bin 0x5500 \
-    fdl fdl2-dl.bin 0x9efffe00 \
-    exec \
-    w splloader ../examples/spl_patched.img \
-    w splloader_bak ../examples/spl_patched.img \
-    w uboot ../examples/uboot_unlocked.img \
-    poweroff
+python3 tools/fdl_qualify.py inventory \
+  --loader-dir /path/to/extracted/loaders \
+  --settings /path/to/settings.ini --json
 ```
 
-The chain:
-
-1. `exec_addr 0x3ee8` triggers the BootROM via USB download mode.
-2. BootROM verification is bypassed for this session only.
-3. `fdl1-dl.bin` is loaded to SRAM at `0x5500` and executed.
-4. `fdl2-dl.bin` is loaded to DRAM at `0x9efffe00`.
-5. The `w <partition> <file>` commands then write directly to eMMC with no signature check.
-6. On next cold boot, BootROM loads our patched SPL from `splloader`, verifies only the DHTB hash (which is valid because `tools/rehash.py` updates it), and runs it.
-7. Our patched SPL skips all downstream RSA checks, so the modified uboot boots normally.
-8. Our modified uboot forces `flash.locked=0`, `verifiedbootstate=orange`, and skips AVB - even though the original device was locked.
-
-On first Android boot, the verified-boot-state change from `green` -> `orange` triggers Android's standard data-wipe flow, so make sure the device is in a state where that's acceptable (factory-fresh or a unit you're OK with resetting).
+See [`docs/FDL_QUALIFICATION.md`](../docs/FDL_QUALIFICATION.md) for protocol
+notes, evidence limits, the source matrix, and a read-only hardware checklist.
+The tool will never label a loader "compatible". A same-SoC label, profile
+name, or plausible address is not validation.
