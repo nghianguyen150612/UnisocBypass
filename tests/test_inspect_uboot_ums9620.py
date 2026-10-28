@@ -31,6 +31,22 @@ def synthetic_image(payload: bytes | None = None) -> bytes:
     return bytes(header) + payload + bytes(footer)
 
 
+def classic_image(payload: bytes | None = None, padding: int = 0) -> bytes:
+    vendor_image = synthetic_image(payload)
+    payload_size = struct.unpack_from("<I", vendor_image, 0x30)[0]
+    payload_end = 0x200 + payload_size
+    classic = bytearray(0x494)
+    classic[:8] = b"SIMGHDR\x00"
+    struct.pack_into("<Q", classic, 0x10, payload_size)
+    struct.pack_into("<Q", classic, 0x18, 0x200)
+    struct.pack_into("<Q", classic, 0x20, 0x254)
+    struct.pack_into("<Q", classic, 0x28, payload_end + 0x60)
+    struct.pack_into(">I", classic, 0x68, 0x10001)
+    classic[0x6C:0x16C] = b"K" * 0x100
+    classic[0x16C:0x18C] = vendor_image[8:0x28]
+    return vendor_image[:payload_end] + bytes(classic) + bytes(padding)
+
+
 class InspectorTests(unittest.TestCase):
     def test_hash_partition_and_instruction_report(self):
         data = synthetic_image()
@@ -53,6 +69,20 @@ class InspectorTests(unittest.TestCase):
         self.assertIsNone(report["load_base"])
         self.assertEqual(report["aarch64_instructions"], [])
         self.assertFalse(report["simghdr"]["signature_verified"])
+
+    def test_padded_vendor_footer_is_not_misclassified_as_classic(self):
+        data = synthetic_image() + bytes(0x4000)
+        report = inspect_bytes(data, partition_size=len(data))
+        self.assertEqual(report["simghdr"]["layout"],
+                         "sprd_signed_image_footer_0x60_unisoc_vendor_layout")
+        self.assertEqual(report["simghdr"]["size"], 0x60)
+
+    def test_padded_classic_footer_is_recognized_from_its_fields(self):
+        data = classic_image(padding=0x4000)
+        report = inspect_bytes(data, partition_size=len(data))
+        self.assertEqual(report["simghdr"]["layout"], "classic_0x494")
+        self.assertEqual(report["simghdr"]["size"], 0x494)
+        self.assertEqual(report["simghdr"]["declared_payload_size"], 16)
 
     def test_cli_emits_json_and_keeps_synthetic_input_unchanged(self):
         data = synthetic_image()
@@ -101,19 +131,29 @@ class InspectorTests(unittest.TestCase):
             inspect_bytes(synthetic_image()[:-0x60])
 
     def test_reject_bad_classic_simghdr_bounds_and_inconsistent_size(self):
-        data = bytearray(synthetic_image())
+        data = bytearray(classic_image())
         payload_end = 0x200 + struct.unpack_from("<I", data, 0x30)[0]
-        classic = bytearray(0x494)
-        classic[:8] = b"SIMGHDR\x00"
-        struct.pack_into("<Q", classic, 0x10, 999)
-        struct.pack_into("<Q", classic, 0x18, 0x200)
-        data[payload_end:payload_end + 0x60] = classic[:0x60]
-        data.extend(classic[0x60:])
+        struct.pack_into("<Q", data, payload_end + 0x10, 999)
         with self.assertRaisesRegex(InspectionError, "payload sizes disagree"):
             inspect_bytes(bytes(data))
 
+        malformed_header_size = bytearray(classic_image())
+        payload_end = 0x200 + struct.unpack_from("<I", malformed_header_size, 0x30)[0]
+        struct.pack_into("<Q", malformed_header_size, payload_end + 0x18, 0x100)
+        with self.assertRaisesRegex(InspectionError, "header_size is not 0x200"):
+            inspect_bytes(bytes(malformed_header_size))
+
+        malformed_structure_size = bytearray(classic_image())
+        payload_end = 0x200 + struct.unpack_from("<I", malformed_structure_size, 0x30)[0]
+        struct.pack_into("<Q", malformed_structure_size, payload_end + 0x20, 0x253)
+        with self.assertRaisesRegex(InspectionError, "signature_structure_size is not 0x254"):
+            inspect_bytes(bytes(malformed_structure_size))
+
         truncated = bytearray(synthetic_image())
         payload_end = 0x200 + struct.unpack_from("<I", truncated, 0x30)[0]
+        payload_size = struct.unpack_from("<I", truncated, 0x30)[0]
+        struct.pack_into("<Q", truncated, payload_end + 0x10, payload_size)
+        struct.pack_into("<Q", truncated, payload_end + 0x18, 0x200)
         struct.pack_into("<Q", truncated, payload_end + 0x20, 0x254)
         with self.assertRaisesRegex(InspectionError, "extends past end of file"):
             inspect_bytes(bytes(truncated))

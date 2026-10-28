@@ -76,16 +76,49 @@ def decode_aarch64(word: int, pc: int | None = None) -> str:
     return f".word 0x{word:08x}"
 
 
-def _parse_footer(data: bytes, offset: int) -> dict[str, Any]:
+def _parse_footer(data: bytes, offset: int, payload_size: int,
+                  dhtb_hash: bytes) -> dict[str, Any]:
     if offset < HEADER_SIZE or offset > len(data):
         raise InspectionError("SIMGHDR offset is outside the input image")
     if offset + 8 > len(data) or data[offset:offset + 7] != b"SIMGHDR":
         raise InspectionError(f"SIMGHDR marker missing at declared payload end 0x{offset:x}")
 
     classic_marker = data[offset:offset + 8] == SIMGHDR_MAGIC
-    classic_struct_size = _u64(data, offset + 0x20) if offset + 0x28 <= len(data) else None
-    if classic_marker and offset + CLASSIC_SIMGHDR_SIZE <= len(data):
+    if classic_marker and offset + 0x30 <= len(data):
+        classic_data_size = _u64(data, offset + 0x10)
+        classic_header_size = _u64(data, offset + 0x18)
+        classic_struct_size = _u64(data, offset + 0x20)
+
+        # The classic structure is identified by its own size fields, never by
+        # how much partition padding happens to follow the footer. Individual
+        # classic markers also make a malformed candidate fail closed instead
+        # of falling back to the shorter vendor interpretation.
+        classic_candidate = (
+            classic_struct_size == 0x254
+            or classic_data_size == payload_size
+            or (classic_data_size != 0 and classic_header_size == HEADER_SIZE)
+        )
+    else:
+        classic_data_size = classic_header_size = classic_struct_size = None
+        classic_candidate = False
+
+    if classic_marker and classic_candidate:
+        if classic_data_size != payload_size:
+            raise InspectionError("DHTB and classic SIMGHDR payload sizes disagree")
+        if classic_header_size != HEADER_SIZE:
+            raise InspectionError("classic SIMGHDR header_size is not 0x200")
+        if classic_struct_size != 0x254:
+            raise InspectionError("classic SIMGHDR signature_structure_size is not 0x254")
+        if offset + CLASSIC_SIMGHDR_SIZE > len(data):
+            raise InspectionError("classic 0x494-byte SIMGHDR extends past end of file")
+
         block = data[offset:offset + CLASSIC_SIMGHDR_SIZE]
+        exponent = struct.unpack_from(">I", block, 0x68)[0]
+        data_hash_copy = block[0x16C:0x18C]
+        if exponent != 0x10001:
+            raise InspectionError("classic SIMGHDR RSA exponent is not 65537")
+        if data_hash_copy != dhtb_hash:
+            raise InspectionError("classic SIMGHDR payload hash does not match DHTB hash")
         return {
             "layout": "classic_0x494",
             "size": CLASSIC_SIMGHDR_SIZE,
@@ -93,14 +126,11 @@ def _parse_footer(data: bytes, offset: int) -> dict[str, Any]:
             "header_size": _u64(block, 0x18),
             "signature_structure_size": _u64(block, 0x20),
             "total_offset": _u64(block, 0x28),
-            "exponent": struct.unpack_from(">I", block, 0x68)[0],
-            "data_hash_copy": block[0x16C:0x18C].hex(),
+            "exponent": exponent,
+            "data_hash_copy": data_hash_copy.hex(),
             "signature_present": any(block[0x1B4:0x2B4]),
             "signature_verified": False,
         }
-
-    if classic_marker and classic_struct_size == 0x254:
-        raise InspectionError("classic 0x494-byte SIMGHDR extends past end of file")
 
     if offset + ANBERNIC_FOOTER_SIZE > len(data):
         raise InspectionError("0x60-byte SIMGHDR footer extends past end of file")
@@ -148,7 +178,7 @@ def inspect_bytes(data: bytes, *, partition_size: int | None = None,
             f"declared payload [0x{payload_start:x}, 0x{payload_end:x}) exceeds file size 0x{len(data):x}"
         )
 
-    footer = _parse_footer(data, payload_end)
+    footer = _parse_footer(data, payload_end, payload_size, stored_hash)
     footer_end = payload_end + footer["size"]
     if footer_end > len(data):
         raise InspectionError("declared payload and SIMGHDR exceed file bounds")

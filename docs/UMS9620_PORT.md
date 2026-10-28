@@ -43,7 +43,10 @@ device profiles:
   the field width used by the UMS9620-specific packer code in this repository.
 * A classic `SIMGHDR\0` block of `0x494` bytes, or the distinct `0x60`-byte
   vendor footer layout expected by the UMS9620 magic packer. Footer bounds,
-  classic declared sizes, and the vendor footer payload-offset field are checked.
+  classic declared sizes, header-size/signature-structure markers, exponent
+  and copied hash, and the vendor footer payload-offset field are checked. The
+  classic layout is selected from its fields before its `0x494` bound is
+  evaluated, so partition zero-padding cannot select it by length alone.
 
 The general [DHTB format note](DHTB_FORMAT.md) and
 [SIMGHDR format note](SIMGHDR_FORMAT.md) describe a different, older image
