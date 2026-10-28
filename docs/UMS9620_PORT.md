@@ -1,165 +1,224 @@
-# UMS9620 / T820 port status
+# UMS9620 research status: Nubia Neo 2 5G (Z2352N)
 
-Porting the unlock/bypass approach from UMS512 (T618) to UMS9620 (T820).
+This document defines an offline research and validation workflow for the
+nubia Neo 2 5G, model **Z2352N**, board **P820F03**, reported SoC **UNISOC T820 /
+UMS9620**. There is no Z2352N U-Boot dump or hardware validation in this
+repository. Its boot chain, image layout, offsets, runtime addresses, partition
+sizes, signature policy, and unlock behavior are **unknown**.
 
-Status: the uboot unlock path is done and confirmed on hardware. Unlike T618,
-the T820 SPL cannot be modified (it is cryptographically verified on a fused
-device), so the model is inverted: keep the stock SPL and deliver the uboot
-patches with the signature-preserving `magic64` method. `tools/patch_uboot_
-unlock_ums9620.py` produces a silent unlocked-boot image in one step
-(force-unlock + strip the warning, timeout, and both SKIP VERIFY prints); the
-shellcode is hand-assembled in pure Python so the output is deterministic.
+**A matching SoC is not evidence of a matching boot chain.** No Anbernic
+offset, base address, signing behavior, SPL assumption, or packaging result in
+this repository is approved for Nubia. Do not patch, repack, or flash a Z2352N
+image based on these materials.
 
-## Important: the T618 SPL route does NOT work on a fused T820
+## Offline inspector
 
-On T618 the DHTB hash is `SHA256(payload)`, so modifying the SPL and rehashing
-is accepted by a hash-only BootROM. On T820 this is false: the stock DHTB hash
-field is not `SHA256(payload)` (or any contiguous range), and the SIMGHDR
-footer carries an RSA cert (exponent `0x10001` + modulus). The T820 SPL is
-cryptographically verified, so a modified + rehashed SPL is rejected and the
-device drops back to download mode (confirmed on hardware).
+`tools/inspect_uboot_ums9620.py` reads one image with `rb`, does not change it,
+does not make a second image, and prints a JSON report to standard output. The
+report includes the file SHA-256, DHTB payload bounds and hash, recognized
+SIMGHDR/footer fields, optional partition-size checks, and optional AArch64
+instruction decoding. It sets no default load base, partition size, or Nubia
+code offset. Signature presence is not signature verification, and a
+structurally valid image is not proof of boot-chain compatibility.
 
-This matches `unisoc_chipram_signcheck`: its patch methods target
-sml/teecfg/trustos/uboot, never the SPL, and it notes SPL/chipram patching
-"only works on un-fused devices." A fused production T820 cannot run a modified
-SPL without the private key.
+Example against a separately acquired dump (the partition size is optional,
+and should only be supplied when known):
 
-So the model is inverted vs T618:
+```sh
+python3 tools/inspect_uboot_ums9620.py uboot_dump.bin > inspection.json
+```
 
-- Keep the STOCK signed SPL, do not modify it.
-- Patch the uboot and make it pass the stock SPL's verification with a
-  signature-preserving method (see below), which SPL verifies uboot (no private key needed).
+Only supply `--partition-size`, `--load-base`, or `--disasm OFFSET[:WORDS]`
+when those values have been established from Z2352N evidence. Payload-relative
+code offsets are distinct from file offsets: in the examined UMS9620 tools,
+payload offset 0 begins at file offset `0x200`. The inspector decodes a limited
+AArch64 subset; other words are preserved as raw `.word` values. Do not treat
+the report's SoC label or its parsed fields as a compatibility verdict.
 
-## SPL analysis (kept for reference / un-fused devices only)
+The inspector accepts the following layouts only as structural formats, not as
+device profiles:
 
-`tools/patch_spl_ums9620.py` neuters the SPL verify dispatcher at code offset
-`0x045b4` (called with an image index in `w0`, returns 0 on pass; 9 cbz-gated
-call sites) to `movz w0,#0 ; ret`. This is structurally correct but only useful
-on an un-fused device where the SPL is hash-only; on a fused device (this one)
-BootROM rejects it. Do not rely on it for a production T820.
+* A `DHTB` header of `0x200` bytes, version 1, with a little-endian 32-bit
+  `mImgSize` at file offset `0x30` and payload beginning at `0x200`. This is
+  the field width used by the UMS9620-specific packer code in this repository.
+* A classic `SIMGHDR\0` block of `0x494` bytes, or the distinct `0x60`-byte
+  vendor footer layout expected by the UMS9620 magic packer. Footer bounds,
+  classic declared sizes, header-size/signature-structure markers, exponent
+  and copied hash, and the vendor footer payload-offset field are checked. The
+  classic layout is selected from its fields before its `0x494` bound is
+  evaluated, so partition zero-padding cannot select it by length alone.
 
-## uboot: the actual path on a fused T820
+The general [DHTB format note](DHTB_FORMAT.md) and
+[SIMGHDR format note](SIMGHDR_FORMAT.md) describe a different, older image
+profile and use a 64-bit size at `0x30` / a `0x494`-byte signature structure.
+That format description must not be silently combined with the assumptions in
+the UMS9620 packer. Confirm field widths and footer meaning against an actual
+Z2352N dump before changing this inspector's accepted format.
 
-Because the stock SPL must stay in place, a modified uboot has to pass that
-SPL's verification. Use one of the `unisoc_chipram_signcheck` methods:
+## Audit of existing UMS9620 files
 
-- `magic64` + `difftool` (Patch-Post-Verification): keep the signed uboot
-  payload intact, append a runtime patcher, signature still verifies. This is
-  the method used here (reimplemented in `tools/magic_pack_ums9620.py`).
-- `bsp_sign_fxxker_for_uboot` (Patch-Pre-Verification): fix the uboot cert chain.
+The following files encode Anbernic-oriented runtime patch and packaging
+assumptions; they are not a Nubia workflow.
 
-The uboot unlock byte-patches these methods need are now pinned (see the table
-below) and packaged by `tools/patch_uboot_unlock_ums9620.py`.
+| File | What it assumes or does | Z2352N status |
+|---|---|---|
+| `tools/patch_uboot_unlock_ums9620.py` | Reads the `DHTB` magic and a 32-bit size at `0x30`, checks four payload-relative instruction words at `0x604c0`, `0xafe8`, `0xb2a4`, and `0xb2ac`, then delegates to the packer. It checks offsets against the declared payload, but does not establish device identity, load base, DHTB hash validity, footer integrity, partition size, or RSA verification. Its instruction masks accept changes in branch immediates / BL targets. Without `--dry-run`, it writes an output image. | Every patch word and mask is from the Anbernic U-Boot described below. A mask match is not proof of matching function semantics or boot chain. Do not run it on a Nubia dump. |
+| `tools/magic_pack_ums9620.py` | Inserts a branch at file offset `0x200`, moves the payload to `0x210`, increases the 32-bit size at `0x30` by `0x100`, emits a fixed shellcode template and patch table, updates the vendor footer fields, then truncates to the input file length after checking discarded bytes are zero. Default load base is `0xb5000000`. | These are Anbernic-specific packaging assumptions. It is an image-writing tool, not an inspector. Do not run it on Nubia or stock images. |
+| `docs/UMS9620_PORT.md` (previous version) | Described T820 unlock and magic packaging as generally hardware-confirmed, including a load base, patch offsets, fused-SPL behavior, and a `0x300000` partition. | Those claims are narrowed below to repository-reported Anbernic experiments; they provide no Z2352N evidence. |
 
-### magic64 signature-preserving packaging: CONFIRMED WORKING
+Neither Python tool cryptographically verifies a SIMGHDR RSA signature. The
+packer preserves the payload bytes it copies into its output and adjusts its
+vendor footer layout, but it does not prove that a target SPL accepts that
+layout or that a signature remains acceptable on another product. The
+inspector reports hash and signature-related fields only; it never verifies
+RSA. Treat the packer as out of scope for the requested read-only workflow.
 
-`tools/magic_pack_ums9620.py` reproduces the `magic64` (Patch-Post-Verification)
-method as a reusable, parameterized packer. It keeps the signed uboot payload
-byte-for-byte (so the stock SPL's RSA check still passes), appends the AArch64
-relocation+patch shellcode and a patch table, moves the SIMGHDR footer, and
-truncates the result back to the partition size (only zero padding is dropped).
+## Existing structures, offsets, and assumptions
 
-Confirmed on hardware (Anbernic T820):
+### DHTB and payload bounds
 
-- Load base `0xb5000000` is correct (the header `mImgAddr` is a placeholder
-  `0xaaaaaaaacccccccc`; base derived from BSS/SP literals and the PAC XML image
-  base `0xb4fffe00 + 0x200`). Runtime patch address = load base + code offset.
-- Patch `0xafe8 = 0xd503201f` (nop) removes the `INFO: LOCK FLAG IS : UNLOCK!!!`
-  line and the "press power button" 10s timeout. Device boots, silent and fast.
-- Output MUST be truncated to the uboot partition size (`0x300000` here); a
-  `0x300100`-byte image gets "write flash failed" from the download tool.
+For the UMS9620-specific packer, the observed model is a `0x200`-byte header,
+payload at file offset `0x200`, and a little-endian 32-bit `mImgSize` at
+`0x30`. An offset described as a payload/code offset `C` therefore maps to
+file offset `0x200 + C` in that model. The DHTB header also contains a stored
+hash at `0x08..0x27`. The inspector computes SHA-256 over the declared payload
+and reports equality; that result says nothing about RSA verification or SPL
+policy.
 
-Usage:
+The general DHTB parser and documentation use an eight-byte size at `0x30`.
+The UMS9620 patch and pack code reads only four bytes. This disagreement is a
+real audit finding, not something to guess away. Z2352N header width and
+semantics must be established from a raw dump, field cross-checks, and the
+target loader before any parser or mutator uses them.
 
-    python3 tools/magic_pack_ums9620.py uboot_b.img out.img \
-        --patch 0xafe8=0xd503201f [--load-base 0xb5000000]
+### SIMGHDR variants
 
-The shellcode is hand-assembled in pure Python (no binutils dependency), so the
-output is byte-for-byte deterministic and reproducible across machines.
+The repository's general format note identifies a classic `SIMGHDR\0`
+signature block of `0x494` bytes with a size, header-size, signature metadata,
+RSA exponent/modulus, hashes, and signature. Its existing parser can report
+those fields, but it does not cryptographically validate the signature.
 
-### One-step unlock tool (parity with the T618 `patch_uboot_unlock.py`)
+The UMS9620 packer instead treats the first `0x60` bytes after its declared
+payload as a vendor footer beginning with `SIMGHDR`. It reads a 64-bit
+`payload_offset` at footer offset `0x18`, expects `0x200` for its input, and
+changes it to `0x210`. For each nonzero value at footer offsets `0x20`, `0x30`,
+`0x40`, and `0x50`, it adds `0x100` to the corresponding next 64-bit field at
+`0x28`, `0x38`, `0x48`, or `0x58`. The code labels the following bytes as
+certificate/private/debug data but does not parse or verify them. The meanings
+and applicability of these paired values are not established for Nubia.
 
-`tools/patch_uboot_unlock_ums9620.py` wraps the packer to give the same
-user-visible result as the T618 unlock tool: the device reports unlocked and
-boots with no warning text and no timeout. It applies all four patches at once:
+Do not conflate the classic `0x494` block with this `0x60` vendor footer, and
+do not infer signing keys, signature coverage, or verification order from the
+presence of either marker alone.
 
-    0x604c0  cbnz w0 -> nop   get_lock_status always reports UNLOCK
-    0xafe8   b.eq   -> nop    remove INFO_UNLOCK line + 10s timeout
-    0xb2a4   bl     -> nop    remove SKIP_VERIFY line (UART)
-    0xb2ac   bl     -> nop    remove SKIP_VERIFY line (screen)
+### Anbernic-specific observations (not Nubia offsets)
 
-Like the T618 tool, each patch point is bitmask-verified against the stock
-instruction before anything is written (masks ignore only branch targets /
-condition-branch offsets that legitimately drift between builds), so a
-different UMS9620 build that no longer matches is rejected rather than silently
-mis-patched. Confirmed on hardware with the 0xafe8/0xb2a4/0xb2ac subset.
+The old port notes report the following for an **Anbernic T820 device and its
+examined U-Boot build**. These are preserved as provenance, not endorsed as
+portable values or independently revalidated in this task:
 
-    python3 tools/patch_uboot_unlock_ums9620.py uboot_b.img out.img
-    python3 tools/patch_uboot_unlock_ums9620.py uboot_b.img --dry-run
+| Payload offset | Reported instruction / change | Reported purpose |
+|---|---|---|
+| `0x604c0` | `0x35000160` (`cbnz w0`) to `0xd503201f` (`nop`) | Force an unlock-status path |
+| `0xafe8` | `0x54000180` (`b.eq`) to `nop` | Suppress an unlock message / delay |
+| `0xb2a4` | `0x9400a21c` (`bl`) to `nop` | Suppress a UART warning print |
+| `0xb2ac` | `0x9401e7a2` (`bl`) to `nop` | Suppress a display warning print |
 
-### Pinned offsets (resolved via aarch64 objdump + capstone)
+The patcher uses masks `0xff00001f` for the conditional branches and
+`0xfc000000` for the two `bl` sites. These masks permit immediate/target drift;
+they do not validate surrounding code, function identity, or control flow.
+All four offsets, stock words, masks, and their stated purposes are
+**Anbernic-specific**. The value `0xb5000000` is the packer's Anbernic-derived
+default load base; the comments cite an Anbernic PAC XML base and hardware
+observation. The `0x300000` partition-size note is also Anbernic-only. Nubia
+values for all of these fields are unknown.
 
-Code offsets are relative to the uboot DHTB payload (file offset 0x200 + code
-offset). Values verified against `uboot_b.img`.
+### What the old hardware claims say
 
-| purpose | code offset | stock | patch to | effect |
-|---|---|---|---|---|
-| remove unlocked-warning message + 10s timeout | `0xafe8` | `54000180` (`b.eq 0xb018`) | `d503201f` (nop) | unlocked device boots silently (skips UART print `0xb020`, screen print `0xb038`, and the 10s power-button countdown `bl 0xae68` at `0xb040`) |
-| force get_lock_status = UNLOCK | `0x604c0` | `35000160` (`cbnz w0, 0x604ec`) | `d503201f` (nop) | always takes the UNLOCK arm (g_DeviceStatus=1, returns 1) |
-| remove `SKIP VERIFY` warning (UART) | `0xb2a4` | `9400a21c` (`bl 0x33b14`) | `d503201f` (nop) | drops the UART print of `WARNNING: LOCK FLAG IS : UNLOCK, SKIP VERIFY!!!` |
-| remove `SKIP VERIFY` warning (screen) | `0xb2ac` | `9401e7a2` (`bl 0x85134`) | `d503201f` (nop) | drops the screen print of the same line |
+The prior documentation reports that an Anbernic UMS9620/T820 unit accepted
+the signature-preserving packaging approach, reports `0xb5000000` as that
+build's payload base, and reports a `0x300000` U-Boot partition. It reports
+hardware checks of the `0xafe8`, `0xb2a4`, and `0xb2ac` subset; the notes do not
+claim equivalent hardware confirmation for `0x604c0`. It separately reports
+the T618 SPL modification route was rejected on a fused Anbernic T820. These
+are prior repository statements about that device/build. There is no Z2352N
+evidence that its SPL is fused, checks RSA, accepts a relocated footer, permits
+post-verification code, or has any of these dimensions.
 
-The `SKIP VERIFY` line comes from a separate status-print function at `0xb238`
-that dispatches on a lock-state global (`adrp 0x260000 ; ldr w0,[x0,#0xd80]`)
-through a jump table (`br x2` at `0xb294`). The unlock case loads the string at
-`0xb5588` (`adrp+add` at `0xb298/0xb29c`) and prints it twice, via `bl 0x33b14`
-(UART) at `0xb2a4` and `bl 0x85134` (screen) at `0xb2ac`. NOPing both bl calls
-suppresses only that line and leaves the jump table intact.
+The packer's stated signature-preservation constraint is to keep the original
+payload bytes it copies unchanged while arranging for a runtime patch after
+verification. Its output also changes the entry bytes, DHTB size, footer
+offsets, and appended data. The code does not prove which bytes the target
+signature covers or that target verification will accept those changes.
+Re-signing is unavailable in this repository without the matching signing
+private key; that observation does not establish Nubia's keys or policy.
 
-Supporting map:
-- `get_lock_status` = `0x60470`: malloc(476) -> `common_raw_read(productinfo,
-  476, 0x2000, buf)` (bl `0x3e184`) -> `sprd_sec_verify_lockstatus(buf, 0x40)`
-  (bl `0xb094`) -> `cbnz w0, LOCK` at `0x604c0` -> stores 1/0 to `g_DeviceStatus`.
-- `g_DeviceStatus` global: `[0x111000 + 0x8c8]` (base-independent page).
-- boot-time lock-warning display fn = `0xafc4`: calls `get_lock_status`, reads
-  `g_DeviceStatus`, branches LOCK (`0xaffc`) / UNLOCK-warning (`0xb018`).
-- `read_is_device_unlocked` is AvbOps vtable slot `[ops+0x48]`, called in
-  `avb_append_options` (`~0x67060`, refs "Error getting device lock state").
+## Exact Z2352N U-Boot evidence required
 
-IMPORTANT: on a fused T820 the SPL RSA-verifies uboot, so a modify+rehash of
-these offsets is rejected (confirmed on hardware). The offsets above are
-therefore delivered with the signature-preserving `magic64` packer, not written
-into the payload. The uboot `mImgAddr` header field is a placeholder
-(`0xaaaaaaaacccccccc`); the real load base is `0xb5000000` (confirmed on
-hardware) and the patch runtime address is `load base + code offset`.
+Before proposing device-specific analysis, collect and preserve a dump and
+metadata package with:
 
-The T820 uboot is the same Unisoc u-boot15 codebase as T618 (identical strings
-"INFO: LOCK FLAG IS : UNLOCK!!!", "WARNNING: LOCK FLAG IS : UNLOCK, SKIP
-VERIFY!!!"), but its register/offset layout differs, so the offsets were
-re-derived from scratch (aarch64 objdump + capstone) rather than reused from
-T618. All four patch sites in the table above are pinned and verified; the
-unlock tool bitmask-checks each one against the stock instruction so a
-different UMS9620 build aborts instead of being mis-patched.
+1. **Identity and provenance:** photographs or system records identifying
+   nubia Neo 2 5G / model Z2352N and board P820F03; Android build fingerprint,
+   firmware build/version, and acquisition date/tool/version. Redact serials,
+   IMEIs, account data, and other personal identifiers.
+2. **Partition map:** authoritative partition names, offsets, sizes, slot
+   suffixes, and storage device. Record whether each U-Boot slot or backup
+   partition is present. The size must come from this device, not the Anbernic
+   `0x300000` observation.
+3. **Unmodified U-Boot dump(s):** exact byte-for-byte raw reads of every
+   available U-Boot slot, including the full partition when practical. Record
+   acquisition method and byte counts. Compute SHA-256 at acquisition and
+   again after transfer; retain the originals read-only and analyze copies.
+4. **Chain context:** matching SPL / first-stage bootloader version and hash,
+   boot mode and active slot, relevant bootloader configuration, and the
+   device's secure-boot / fuse state from a trustworthy read-only source.
+   Include the signed-image metadata needed to identify the actual header and
+   footer formats. Do not infer fuse state from the SoC name.
+5. **Address evidence:** the image's declared address fields, matching board
+   PAC/XML or equivalent vendor metadata if available, relocation / entry
+   sequence, and independent evidence for the physical load address. Record
+   uncertainty and address coordinate system.
+6. **Target-specific code map:** exact Z2352N disassembly around any proposed
+   function, cross-references, strings, branch destinations, and neighboring
+   instructions. Each candidate offset must be derived from this dump and
+   matched to behavior by control-flow analysis. An Anbernic instruction
+   match or string match is insufficient.
 
-## Re-signing: not possible, not needed
+The read-only inspector report should accompany the raw dump's SHA-256 and the
+partition-map evidence. It does not replace any item above, a boot-chain
+analysis, or signature verification.
 
-The T820 AVB keys are all different from the T618 set (top-level vbmeta
-`8e3c8f11`, boot/dtbo `3b0792d6`, vendor_boot `87bc5eef`), and we do not hold
-the T820 private keys. The patch route needs no re-signing (BootROM checks only
-the regenerated DHTB hash). Consequence: the T618 "re-sign dtbo with the boot
-key" trick cannot be used on T820; a modified T820 dtbo would need vbmeta
-hashtree-disable or a uboot/TOS patch instead.
+## Validation gates before any patch or flash
 
-## Related external tooling
+No gate below is currently satisfied for Z2352N. A later, separately reviewed
+change would need to document evidence for each applicable gate:
 
-`unisoc_chipram_signcheck` (magic32/64 + difftool, bsp_sign_fxxker) offers
-alternative uboot packaging that keeps the original signature valid, and notes
-that `dis_avb` in spd_dump_it / SPRDClientCore-Xia uses the same method; those
-tools may already carry a ums9620 AVB-disable offset set worth checking before
-finishing the manual RE.
+1. Confirm model/board/build and obtain hash-stable dumps for the relevant
+   slots and matching SPL.
+2. Resolve DHTB field widths, payload boundaries, SIMGHDR/footer variant,
+   hash meaning, signature coverage, and partition padding using the dump and
+   independent format evidence. The inspector must parse it without guessed
+   offsets and report all bounds checks cleanly.
+3. Establish the actual SPL verification path, key selection, secure-boot
+   state, and whether any proposed delivery method is accepted. Do not assume
+   that the Anbernic fused-device result applies.
+4. Derive any candidate code location, runtime address, and control-flow
+   effect solely from the Z2352N build. Validate all branch targets and
+   surrounding instructions; do not rely on the existing Anbernic masks.
+5. Review the exact proposed binary transformation, image length, partition
+   bounds, preserved signed bytes, footer changes, and cryptographic
+   implications offline. Synthetic fixtures and host-side tests cannot prove
+   that real hardware accepts it.
+6. Require independent review and explicit authorization before any future
+   operation that writes an image or touches hardware. This branch performs no
+   such operation and does not assert that an unlock is possible.
 
-## Structural differences vs T618
+## Synthetic validation and CI
 
-Adds `init_boot` (separate generic ramdisk), `hypervisor`, `ise`,
-`avbmeta_rs`; newer platform (likely 5.15 kernel, so the erofs feature-`0x2`
-mount problem seen on T618/5.4 will not apply).
+The inspector tests construct tiny synthetic DHTB/footer images in memory.
+They cover SHA-256 reporting, size and footer bounds, partition limits,
+malformed headers, inconsistent SIMGHDR sizes, and AArch64 decoding of a
+small instruction subset. They do not use or modify repository stock image
+fixtures and do not model the Z2352N boot chain. GitHub Actions runs Ruff and
+the Python unit suite on pushes and pull requests.
