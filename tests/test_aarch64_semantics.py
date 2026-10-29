@@ -7,8 +7,9 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from tools.aarch64_semantics import SCHEMA, analyze, disassemble, main
+from tools.aarch64_semantics import DEFAULT_LIMITS, SCHEMA, analyze, disassemble, main
 
 
 def words(*values):
@@ -102,6 +103,76 @@ class GraphTests(unittest.TestCase):
         r = report(code, entries=(0, 4))
         callee = next(c for c in r["function_candidates"] if c["entry_payload_offset"] == 16)
         self.assertEqual(callee["direct_callers"], [0, 4])
+
+
+    def test_unknown_word_stops_flow_and_downgrades_confidence(self):
+        # Treat undecodable bytes as a boundary, not an ordinary instruction.
+        code = words(0xffffffff, 0xd65f03c0)
+        r = report(code)
+        self.assertEqual(r["instructions"][0]["classification"], "unknown")
+        self.assertFalse(any(
+            e["source_block"] == 0 and e["destination_payload_offset"] == 4
+            for e in r["control_flow_edges"]))
+        self.assertEqual(r["function_candidates"][0]["confidence"], "UNKNOWN")
+        self.assertTrue(any(u["type"] == "unknown" for u in r["unresolved_references"]))
+
+    def test_eret_is_unsupported_control_transfer_not_fallthrough(self):
+        code = words(0xd69f03e0, 0xd65f03c0)
+        r = report(code)
+        self.assertEqual(r["instructions"][0]["classification"], "unsupported_control_transfer")
+        self.assertFalse(r["instructions"][0]["fallthrough"])
+        self.assertFalse(any(
+            e["source_block"] == 0 and e["destination_payload_offset"] == 4
+            for e in r["control_flow_edges"]))
+        self.assertEqual(r["function_candidates"][0]["confidence"], "LOW")
+
+    def test_incomplete_direct_call_candidate_is_low_confidence(self):
+        code = words(b(0, 8, True), 0xd65f03c0, 0xffffffff)
+        r = report(code)
+        callee = next(c for c in r["function_candidates"] if c["entry_payload_offset"] == 8)
+        self.assertEqual(callee["confidence"], "UNKNOWN")
+        self.assertTrue(callee["unresolved_outgoing_transfers"])
+        self.assertEqual(r["function_candidates"][0]["confidence"], "HIGH")
+
+    def test_direct_call_to_lower_address_is_not_a_loop(self):
+        # Entry at 4 calls a callee at 0, and returns via continuation at 8.
+        code = words(0xd65f03c0, b(4, 0, True), 0xd65f03c0)
+        r = report(code, entries=(4,))
+        call = next(e for e in r["control_flow_edges"] if e["type"] == "direct_call")
+        self.assertTrue(call["backward_edge"])
+        self.assertFalse(call["loop"])
+
+    def test_backward_jump_without_cycle_is_not_a_loop(self):
+        # Jump back to a separate return block: no path returns to the jump.
+        code = words(0xd65f03c0, 0xd503201f, b(8, 0))
+        r = report(code, entries=(8,))
+        jump = next(e for e in r["control_flow_edges"] if e["type"] == "unconditional_branch")
+        self.assertTrue(jump["backward_edge"])
+        self.assertFalse(jump["loop"])
+
+    def test_real_self_cycle_is_marked_loop(self):
+        r = report(words(b(0, 0)))
+        loop = next(e for e in r["control_flow_edges"] if e["type"] == "unconditional_branch")
+        self.assertTrue(loop["backward_edge"])
+        self.assertTrue(loop["loop"])
+
+    def test_blr_has_unresolved_call_and_continuation_xref(self):
+        r = report(words(0xd63f0000, 0xd65f03c0))
+        self.assertTrue(any(
+            x["type"] == "fallthrough" and x["source_payload_offset"] == 0
+            and x["destination_payload_offset"] == 4
+            for x in r["direct_xrefs"]))
+        self.assertTrue(any(x["type"] == "indirect_transfer_unresolved"
+                            for x in r["direct_xrefs"]))
+        self.assertEqual(r["function_candidates"][0]["confidence"], "LOW")
+
+    def test_configured_byte_limit_overrides_decoder_default(self):
+        code = words(0xd503201f, 0xd503201f, 0xd65f03c0)
+        with patch.dict(DEFAULT_LIMITS, {"bytes": 8}):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                report(code)
+            r = report(code, limits={"bytes": 12})
+        self.assertEqual(len(r["instructions"]), 3)
 
 
 class ReportTests(unittest.TestCase):
