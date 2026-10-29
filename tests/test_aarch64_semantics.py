@@ -127,10 +127,10 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(r["function_candidates"][0]["confidence"], "LOW")
 
     def test_incomplete_direct_call_candidate_is_low_confidence(self):
-        code = words(b(0, 8, True), 0xd65f03c0, 0xffffffff)
+        code = words(b(0, 8, True), 0xd65f03c0, 0xd503201f, 0xffffffff)
         r = report(code)
         callee = next(c for c in r["function_candidates"] if c["entry_payload_offset"] == 8)
-        self.assertEqual(callee["confidence"], "UNKNOWN")
+        self.assertEqual(callee["confidence"], "LOW")
         self.assertTrue(callee["unresolved_outgoing_transfers"])
         self.assertEqual(r["function_candidates"][0]["confidence"], "HIGH")
 
