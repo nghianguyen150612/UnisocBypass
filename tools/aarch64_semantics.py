@@ -31,19 +31,36 @@ def _runtime(base: int | None, payload_offset: int) -> int | None:
 
 def _kind(insn: Any) -> str:
     m = insn.mnemonic.lower()
-    return {"b": "branch", "bl": "call", "br": "indirect_branch", "blr": "indirect_call",
-            "ret": "return"}.get(m, "conditional_branch" if m.startswith("b.") or
-            m in {"cbz", "cbnz", "tbz", "tbnz"} else "ordinary")
+    direct = {"b": "branch", "bl": "call", "br": "indirect_branch",
+              "blr": "indirect_call", "ret": "return"}
+    if m in direct:
+        return direct[m]
+    if m in {"retaa", "retab"}:
+        return "return"
+    if m in {"braa", "brab", "braaz", "brabz"}:
+        return "indirect_branch"
+    if m in {"blraa", "blrab", "blraaz", "blrabz"}:
+        return "indirect_call"
+    if m.startswith("b.") or m in {"cbz", "cbnz", "tbz", "tbnz"}:
+        return "conditional_branch"
+    if m in {"eret", "eretaa", "eretab", "drps", "brk", "hlt", "svc",
+             "hvc", "smc", "dcps1", "dcps2", "dcps3", "udf"}:
+        # Exception/privilege transfers have no proven sequential successor.
+        return "unsupported_control_transfer"
+    return "ordinary"
 
 
 def disassemble(code: bytes, start: int, length: int, *, payload_file_offset: int = 0,
-                load_base: int | None = None, max_instructions: int = 65536) -> list[dict[str, Any]]:
+                load_base: int | None = None, max_instructions: int = 65536,
+                max_bytes: int = DEFAULT_LIMITS["bytes"]) -> list[dict[str, Any]]:
     """Decode a supplied bounded byte range. Offsets refer to the input buffer."""
     if not isinstance(code, bytes):
         raise TypeError("code must be immutable bytes")
     if start < 0 or length < 0 or start % 4 or length % 4 or payload_file_offset < 0:
         raise ValueError("offsets and length must be nonnegative and four-byte aligned")
-    if length > DEFAULT_LIMITS["bytes"] or start > len(code) or length > len(code) - start:
+    if max_bytes <= 0 or max_instructions <= 0:
+        raise ValueError("resource limits must be positive")
+    if length > max_bytes or start > len(code) or length > len(code) - start:
         raise ValueError("range exceeds buffer or byte limit")
     if length // 4 > max_instructions:
         raise ValueError("instruction limit exceeded")
@@ -67,9 +84,11 @@ def disassemble(code: bytes, start: int, length: int, *, payload_file_offset: in
                 immediates = [op for op in insn.operands if op.type == ARM64_OP_IMM]
                 if immediates:
                     target = int(immediates[-1].imm)
-                if load_base is not None:
+                if load_base is not None and target is not None:
                     target -= load_base
-        fallthrough = None if not insn else kind not in {"branch", "return", "indirect_branch"}
+        fallthrough = None if not insn else kind not in {
+            "branch", "return", "indirect_branch", "unsupported_control_transfer"
+        }
         result.append({"file_offset": file_offset, "payload_offset": p,
             "runtime_address": pc, "raw_word": f"0x{int.from_bytes(raw, 'little'):08x}",
             "bytes": raw.hex(), "mnemonic": insn.mnemonic if insn else None,
@@ -114,7 +133,8 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
         if total > lim["bytes"]:
             raise ValueError("total byte limit exceeded")
         ins = disassemble(code, start, size, payload_file_offset=payload_file_offset,
-                          load_base=load_base, max_instructions=lim["instructions"])
+                          load_base=load_base, max_instructions=lim["instructions"],
+                          max_bytes=lim["bytes"])
         if len(instructions) + len(ins) > lim["instructions"]:
             raise ValueError("instruction limit exceeded")
         instructions.update({i["payload_offset"]: i for i in ins})
@@ -133,7 +153,9 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
                 leaders.add(dest)
             else:
                 incoming.setdefault(dest, set()).add("external")
-        if ins["classification"] in {"branch", "conditional_branch", "call", "return", "indirect_branch", "indirect_call"}:
+        if ins["classification"] in {"branch", "conditional_branch", "call", "return",
+                                     "indirect_branch", "indirect_call", "unknown",
+                                     "unsupported_control_transfer"}:
             nxt = off + 4
             if nxt in instructions:
                 leaders.add(nxt)
@@ -158,8 +180,7 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
         dest_block = dst if dst in by_start else None
         edges.append({"source_block": src, "destination_payload_offset": dst,
                       "destination_block": dest_block,
-                      "type": typ, "resolution": status,
-                      "loop": dest_block is not None and dest_block <= src})
+                      "type": typ, "resolution": status})
 
     for b in blocks:
         lastoff = b["instructions"][-1]
@@ -187,6 +208,12 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
             if k == "indirect_call":
                 status_next = "internal" if nextoff in instructions else "external_or_out_of_range"
                 edge(b["start"], nextoff, "call_continuation", status_next)
+                xrefs.append(_xref(ins, "fallthrough", nextoff, status_next))
+        elif k in {"unknown", "unsupported_control_transfer"}:
+            edge(b["start"], None, "unresolved_control_flow", "unresolved")
+            unresolved.append({"source_payload_offset": lastoff, "type": k,
+                               "reason": "instruction semantics or successor not established"})
+            xrefs.append(_xref(ins, "unresolved_control_flow", None, "unresolved"))
         elif nextoff in instructions:
             edge(b["start"], nextoff, "fallthrough", "internal")
             xrefs.append(_xref(ins, "fallthrough", nextoff, "internal"))
@@ -194,6 +221,61 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
             edge(b["start"], nextoff, "range_exit", "external_or_out_of_range")
     if len(edges) > lim["edges"]:
         raise ValueError("edge limit exceeded")
+
+    # Compute actual cycles in the non-call CFG. An address-backward jump,
+    # including a BL into an earlier function, is not itself a loop.
+    successors = {n: set() for n in by_start}
+    predecessors = {n: set() for n in by_start}
+    for graph_edge in edges:
+        dst = graph_edge["destination_block"]
+        src = graph_edge["source_block"]
+        if dst is not None and graph_edge["type"] != "direct_call":
+            successors[src].add(dst)
+            predecessors[dst].add(src)
+
+    visited: set[int] = set()
+    finish_order: list[int] = []
+    for first in sorted(successors):
+        if first in visited:
+            continue
+        visited.add(first)
+        pending_dfs = [(first, iter(sorted(successors[first])))]
+        while pending_dfs:
+            node, children = pending_dfs[-1]
+            child = next(children, None)
+            if child is None:
+                finish_order.append(node)
+                pending_dfs.pop()
+            elif child not in visited:
+                visited.add(child)
+                pending_dfs.append((child, iter(sorted(successors[child]))))
+
+    components: dict[int, int] = {}
+    component_sizes: dict[int, int] = {}
+    for first in reversed(finish_order):
+        if first in components:
+            continue
+        component = len(component_sizes)
+        pending_reverse = [first]
+        components[first] = component
+        count = 0
+        while pending_reverse:
+            node = pending_reverse.pop()
+            count += 1
+            for previous in sorted(predecessors[node]):
+                if previous not in components:
+                    components[previous] = component
+                    pending_reverse.append(previous)
+        component_sizes[component] = count
+
+    for graph_edge in edges:
+        src, dst = graph_edge["source_block"], graph_edge["destination_block"]
+        graph_edge["backward_edge"] = dst is not None and dst <= src
+        graph_edge["loop"] = bool(
+            dst is not None and graph_edge["type"] != "direct_call"
+            and components[src] == components[dst]
+            and (component_sizes[components[src]] > 1 or src == dst)
+        )
     edges.sort(key=lambda x: (x["source_block"], x["type"], -1 if x["destination_payload_offset"] is None else x["destination_payload_offset"]))
     xrefs.sort(key=lambda x: (x["source_payload_offset"], x["type"], -1 if x["destination_payload_offset"] is None else x["destination_payload_offset"]))
 
@@ -232,7 +314,13 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
         external_out = [e for e in edges if e["source_block"] in seen and
                         e["resolution"] == "external_or_out_of_range"]
         is_explicit = root in entries
-        conf = "HIGH" if is_explicit and not unresolved_out and not external_out else "MEDIUM" if not is_explicit else "LOW"
+        incomplete = bool(unresolved_out or external_out or not returns)
+        if instructions[root]["classification"] == "unknown":
+            conf = "UNKNOWN"
+        elif incomplete:
+            conf = "LOW"
+        else:
+            conf = "HIGH" if is_explicit else "MEDIUM"
         candidates.append({"id": f"candidate-{idx:04d}", "entry_payload_offset": root,
             "entry_file_offset": payload_file_offset + root, "runtime_entry": _runtime(load_base, root),
             "discovery_reason": "explicit_entry" if is_explicit else "direct_BL_target",
@@ -243,7 +331,7 @@ def analyze(code: bytes, *, file_sha256: str, payload_file_offset: int,
             "limitations": ["static candidate boundary; not a proven complete function"]})
     for c in candidates:
         c["shared_blocks"] = sorted(n for n in c["reachable_blocks"] if len(ownership[n]) > 1)
-        if c["shared_blocks"]:
+        if c["shared_blocks"] and c["confidence"] != "UNKNOWN":
             c["confidence"] = "LOW"
     for b in blocks:
         b["end"] = b["instructions"][-1] + 4
