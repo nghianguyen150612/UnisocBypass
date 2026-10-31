@@ -107,6 +107,48 @@ def _parse_footer(data: bytes, offset: int, payload_size: int,
             raise InspectionError("DHTB and classic SIMGHDR payload sizes disagree")
         if classic_header_size != HEADER_SIZE:
             raise InspectionError("classic SIMGHDR header_size is not 0x200")
+        if classic_struct_size in (0x438, 0x458):
+            # Observed in Z2352N OTA images: U-Boot 0x458, SML/TrustOS
+            # 0x438. The 0x60-byte SIMGHDR prefix points to a separate
+            # RSA-4096 key-certificate candidate. Do not treat the size as
+            # the classic inline signature structure (0x254).
+            cert_offset = _u64(data, offset + 0x28)
+            if cert_offset != offset + ANBERNIC_FOOTER_SIZE:
+                raise InspectionError(
+                    "RSA4096 SIMGHDR certificate offset is not after the 0x60-byte prefix"
+                )
+            cert_end = cert_offset + classic_struct_size
+            if cert_end > len(data):
+                raise InspectionError("RSA4096 certificate extends past end of file")
+            cert = data[cert_offset:cert_end]
+            version_candidate = _u32(cert, 0)
+            rsa_bits_candidate = _u32(cert, 4)
+            exponent_candidate = struct.unpack_from(">I", cert, 8)[0]
+            if version_candidate not in (0, 1):
+                raise InspectionError("unsupported RSA4096 certificate version candidate")
+            if rsa_bits_candidate != 4096:
+                raise InspectionError("RSA4096 certificate key bits field is not 4096")
+            if exponent_candidate != 65537:
+                raise InspectionError("RSA4096 certificate exponent field is not 65537")
+            trailing = data[cert_end:]
+            return {
+                "layout": "sprd_simghdr_0x60_rsa4096_certificate_candidate",
+                "size": ANBERNIC_FOOTER_SIZE,
+                "declared_payload_size": classic_data_size,
+                "header_size": classic_header_size,
+                "certificate_offset": cert_offset,
+                "certificate_size": classic_struct_size,
+                "certificate_end": cert_end,
+                "certificate_sha256": hashlib.sha256(cert).hexdigest(),
+                "certificate_nonzero_bytes": sum(bool(byte) for byte in cert),
+                "certificate_version_candidate": version_candidate,
+                "rsa_key_bits_candidate": rsa_bits_candidate,
+                "rsa_exponent_candidate": exponent_candidate,
+                "trailing_size": len(trailing),
+                "trailing_all_zero": not any(trailing),
+                "certificate_format_verified": False,
+                "signature_verified": False,
+            }
         if classic_struct_size != 0x254:
             raise InspectionError("classic SIMGHDR signature_structure_size is not 0x254")
         if offset + CLASSIC_SIMGHDR_SIZE > len(data):
@@ -179,7 +221,9 @@ def inspect_bytes(data: bytes, *, partition_size: int | None = None,
         )
 
     footer = _parse_footer(data, payload_end, payload_size, stored_hash)
-    footer_end = payload_end + footer["size"]
+    # The RSA-4096 layout includes a separate certificate after its 0x60
+    # SIMGHDR prefix. Bounds reporting must cover the entire certificate.
+    footer_end = footer.get("certificate_end", payload_end + footer["size"])
     if footer_end > len(data):
         raise InspectionError("declared payload and SIMGHDR exceed file bounds")
     if footer["layout"] == "classic_0x494":
@@ -187,12 +231,18 @@ def inspect_bytes(data: bytes, *, partition_size: int | None = None,
             raise InspectionError("DHTB and classic SIMGHDR payload sizes disagree")
         if footer["header_size"] != HEADER_SIZE:
             raise InspectionError("classic SIMGHDR header_size is not 0x200")
-    else:
+    elif footer["layout"] == "sprd_signed_image_footer_0x60_unisoc_vendor_layout":
         payload_offset = footer["payload_offset"]
         if payload_offset not in (HEADER_SIZE, HEADER_SIZE + 0x10):
             raise InspectionError(
                 f"unsupported vendor footer payload_offset 0x{payload_offset:x}"
             )
+    elif footer["layout"] == "sprd_simghdr_0x60_rsa4096_certificate_candidate":
+        # _parse_footer already validated candidate fields and certificate
+        # bounds. No vendor payload_offset exists in this layout.
+        pass
+    else:
+        raise InspectionError("unsupported SIMGHDR layout")
 
     payload = data[payload_start:payload_end]
     computed_hash = hashlib.sha256(payload).hexdigest()
