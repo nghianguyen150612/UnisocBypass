@@ -221,7 +221,9 @@ def inspect_bytes(data: bytes, *, partition_size: int | None = None,
         )
 
     footer = _parse_footer(data, payload_end, payload_size, stored_hash)
-    footer_end = payload_end + footer["size"]
+    # The RSA-4096 layout includes a separate certificate after its 0x60
+    # SIMGHDR prefix. Bounds reporting must cover the entire certificate.
+    footer_end = footer.get("certificate_end", payload_end + footer["size"])
     if footer_end > len(data):
         raise InspectionError("declared payload and SIMGHDR exceed file bounds")
     if footer["layout"] == "classic_0x494":
@@ -229,12 +231,18 @@ def inspect_bytes(data: bytes, *, partition_size: int | None = None,
             raise InspectionError("DHTB and classic SIMGHDR payload sizes disagree")
         if footer["header_size"] != HEADER_SIZE:
             raise InspectionError("classic SIMGHDR header_size is not 0x200")
-    else:
+    elif footer["layout"] == "sprd_signed_image_footer_0x60_unisoc_vendor_layout":
         payload_offset = footer["payload_offset"]
         if payload_offset not in (HEADER_SIZE, HEADER_SIZE + 0x10):
             raise InspectionError(
                 f"unsupported vendor footer payload_offset 0x{payload_offset:x}"
             )
+    elif footer["layout"] == "sprd_simghdr_0x60_rsa4096_certificate_candidate":
+        # _parse_footer already validated candidate fields and certificate
+        # bounds. No vendor payload_offset exists in this layout.
+        pass
+    else:
+        raise InspectionError("unsupported SIMGHDR layout")
 
     payload = data[payload_start:payload_end]
     computed_hash = hashlib.sha256(payload).hexdigest()
