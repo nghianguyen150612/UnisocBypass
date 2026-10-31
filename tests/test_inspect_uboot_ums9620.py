@@ -47,6 +47,23 @@ def classic_image(payload: bytes | None = None, padding: int = 0) -> bytes:
     return vendor_image[:payload_end] + bytes(classic) + bytes(padding)
 
 
+def rsa4096_image(cert_size: int = 0x458, version: int = 1,
+                  padding: int = 0x80, payload: bytes | None = None) -> bytes:
+    base = synthetic_image(payload)
+    payload_end = 0x200 + struct.unpack_from("<I", base, 0x30)[0]
+    footer = bytearray(0x60)
+    footer[:8] = b"SIMGHDR\x00"
+    struct.pack_into("<Q", footer, 0x10, payload_end - 0x200)
+    struct.pack_into("<Q", footer, 0x18, 0x200)
+    struct.pack_into("<Q", footer, 0x20, cert_size)
+    struct.pack_into("<Q", footer, 0x28, payload_end + 0x60)
+    certificate = bytearray(cert_size)
+    struct.pack_into("<II", certificate, 0, version, 4096)
+    struct.pack_into(">I", certificate, 8, 65537)
+    certificate[-1] = 0x5A
+    return base[:payload_end] + bytes(footer) + bytes(certificate) + bytes(padding)
+
+
 class InspectorTests(unittest.TestCase):
     def test_hash_partition_and_instruction_report(self):
         data = synthetic_image()
@@ -83,6 +100,66 @@ class InspectorTests(unittest.TestCase):
         self.assertEqual(report["simghdr"]["layout"], "classic_0x494")
         self.assertEqual(report["simghdr"]["size"], 0x494)
         self.assertEqual(report["simghdr"]["declared_payload_size"], 16)
+
+    def test_recognizes_z2352n_rsa4096_certificate_sizes_without_claiming_verification(self):
+        for cert_size, version in ((0x458, 1), (0x438, 0)):
+            with self.subTest(cert_size=cert_size):
+                data = rsa4096_image(cert_size, version, padding=0x80)
+                before = bytes(data)
+                report = inspect_bytes(data, partition_size=len(data))
+                footer = report["simghdr"]
+                self.assertEqual(footer["layout"],
+                                 "sprd_simghdr_0x60_rsa4096_certificate_candidate")
+                self.assertEqual(footer["certificate_size"], cert_size)
+                self.assertEqual(footer["certificate_version_candidate"], version)
+                self.assertEqual(footer["rsa_key_bits_candidate"], 4096)
+                self.assertEqual(footer["rsa_exponent_candidate"], 65537)
+                self.assertTrue(footer["trailing_all_zero"])
+                self.assertFalse(footer["certificate_format_verified"])
+                self.assertFalse(footer["signature_verified"])
+                self.assertTrue(report["dhtb"]["payload_hash_matches_header"])
+                self.assertEqual(data, before)
+
+    def test_rsa4096_trailing_data_is_reported_not_misrepresented_as_padding(self):
+        data = bytearray(rsa4096_image())
+        data[-1] = 0xFF
+        report = inspect_bytes(bytes(data))
+        self.assertFalse(report["simghdr"]["trailing_all_zero"])
+        self.assertEqual(report["simghdr"]["trailing_size"], 0x80)
+
+    def test_reject_rsa4096_bad_certificate_bounds_and_header(self):
+        baseline = rsa4096_image()
+        payload_end = 0x200 + struct.unpack_from("<I", baseline, 0x30)[0]
+        cert_start = payload_end + 0x60
+
+        wrong_offset = bytearray(baseline)
+        struct.pack_into("<Q", wrong_offset, payload_end + 0x28, cert_start + 1)
+        with self.assertRaisesRegex(InspectionError, "certificate offset"):
+            inspect_bytes(bytes(wrong_offset))
+
+        truncated = baseline[:cert_start + 0x458 - 1]
+        with self.assertRaisesRegex(InspectionError, "certificate extends"):
+            inspect_bytes(truncated)
+
+        wrong_bits = bytearray(baseline)
+        struct.pack_into("<I", wrong_bits, cert_start + 4, 2048)
+        with self.assertRaisesRegex(InspectionError, "key bits"):
+            inspect_bytes(bytes(wrong_bits))
+
+        wrong_exponent = bytearray(baseline)
+        struct.pack_into(">I", wrong_exponent, cert_start + 8, 3)
+        with self.assertRaisesRegex(InspectionError, "exponent"):
+            inspect_bytes(bytes(wrong_exponent))
+
+        wrong_version = bytearray(baseline)
+        struct.pack_into("<I", wrong_version, cert_start, 2)
+        with self.assertRaisesRegex(InspectionError, "version candidate"):
+            inspect_bytes(bytes(wrong_version))
+
+        wrong_size = bytearray(baseline)
+        struct.pack_into("<Q", wrong_size, payload_end + 0x20, 0x459)
+        with self.assertRaisesRegex(InspectionError, "signature_structure_size"):
+            inspect_bytes(bytes(wrong_size))
 
     def test_cli_emits_json_and_keeps_synthetic_input_unchanged(self):
         data = synthetic_image()
