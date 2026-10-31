@@ -111,6 +111,12 @@ class InspectorTests(unittest.TestCase):
                 self.assertEqual(footer["layout"],
                                  "sprd_simghdr_0x60_rsa4096_certificate_candidate")
                 self.assertEqual(footer["certificate_size"], cert_size)
+                self.assertEqual(
+                    footer["certificate_end"],
+                    0x200 + 16 + 0x60 + cert_size
+                )
+                self.assertTrue(report["partition"]["declared_payload_and_footer_fit"])
+                self.assertNotIn("payload_offset", footer)
                 self.assertEqual(footer["certificate_version_candidate"], version)
                 self.assertEqual(footer["rsa_key_bits_candidate"], 4096)
                 self.assertEqual(footer["rsa_exponent_candidate"], 65537)
