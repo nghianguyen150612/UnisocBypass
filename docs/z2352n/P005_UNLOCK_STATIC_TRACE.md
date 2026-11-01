@@ -40,3 +40,31 @@ Use Python to print `windows.compare_helper_candidate.instructions`, conditional
 - Confirm helper semantics and handler references using control-flow analysis, not string presence alone.
 - Jump table reconstruction, real function boundaries, lock-state source, nonce/authorization and AVB/RSA signature verification are **still unproven**.
 - No firmware changes, bypass instructions or write operations in P005.
+
+## External FDL / recovery evidence triage (2026-11-01)
+
+These public records were checked for the same model and must not be confused:
+
+| Record | Identified hardware | What it supports | What it does NOT establish |
+| --- | --- | --- | --- |
+| [Martview thread](https://www.martview-forum.com/threads/zte-nubia-neo-2-5g-z2352n-unisoc-t820-frp-remove.127020/) | Despite the thread title `Z2352N`, the pasted successful CM2SP3 log identifies **nubia 8150N / P720F03_A**, `eMMC`, and `ZTE/8150N` loaders | 8150N-specific FDL1/FDL2 execution and backup were reported | **No Z2352N/P820F03 FDL success**. Sharing the T820/UMS9620 SoC does not qualify those loaders for the Nubia Neo 2 |
+| [GSMVN service report](https://gsmvn.net/threads/nubia-neo-2-z2352n-frp-one-click.3002/) | Explicit **Z2352N / P820F03 / UMS9620**, with `Storage type: UFS` and MyOS13.0.4_Z2352N_VN | A third-party service log reports preloader/mainloader execution, UFS detection, partition reads, and a backup | No downloadable, hash-qualified FDL pair, host command sequence, independent reproduction, or owner-controlled recovery path; it is not unlock evidence |
+| [Lionrome package listing](https://www.lionrome.com/index.php?a=downloads&b=tags&tag=P820F03+Firmware) | Advertises `Z2352N_GEN_NEEA_P820F03V1.0.0B11_MyOS13.0.4_Z2352N_AS.PAC` (4.30 GB) | Another potential stock PAC provenance lead | No inspected archive, loader extraction or verified free download; merchant licensing applies |
+| [FirmwareWorld listing](https://firmwareworld.com/index.php?a=downloads&b=tags&tag=emergency+firmware) | Z2352N-SA PAC (paid) and SD-card software (listed Featured) | Region/build-specific firmware leads | SD-card/OTA update is not proof that FDL1/FDL2 are bundled, and paid PAC contents remain uninspected |
+
+### Consequences for the project
+
+- P002/P002A candidate FDL states remain **UNVERIFIED**; 8150N loaders are not promoted to Z2352N-compatible because of a thread title or SoC match.
+- There is **no public, source-proven, downloadable Z2352N signed FDL pair** verified by these records. No FDL upload, execution, device command, UFS write or flash was performed.
+- Even a reported UFS connection does not demonstrate that a locally available loader will operate safely on the owner's handset or that modified bootloader images will pass secure boot.
+- Preserve `P005` as Draft until the original owner-held OTA U-Boot is analyzed by the SHA-gated collector and the complete read-only output is reviewed. The expected U-Boot SHA in this document is a **previously recorded value**, not a fresh download or device hash in this run.
+- To share evidence without exposing firmware, redact locally produced JSON output and provide SHA-256, the bounded windows and caller candidates. Do not commit firmware or device identifiers.
+
+### Qualification record (current)
+
+- P005 synthetic validation: GitHub Actions on the branch; tests must be checked at final commit.
+- P005 real-OTA execution from this review environment: **NOT PERFORMED** (owner's original `uboot.img` not mounted here).
+- Original image hash checked in this environment: **NOT PERFORMED**.
+- Z2352N FDL1/FDL2 run on owner's hardware: **UNVERIFIED**.
+- Z2352N UFS backup/recovery under owner's control: **UNVERIFIED**.
+- Z2352N unlock policy transition, magic64 compatibility, AVB relaxation: **UNVERIFIED**.
