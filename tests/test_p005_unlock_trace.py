@@ -1,8 +1,13 @@
+import contextlib
 import hashlib
+import io
+import json
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
-from tools.p005_unlock_trace import analyze_image, scan_direct_bl
+from tools.p005_unlock_trace import analyze_image, main, scan_direct_bl
 
 
 def image_with_payload(payload: bytes) -> bytes:
@@ -58,6 +63,48 @@ class P005ReadOnlyTraceTests(unittest.TestCase):
             analyze_image(image, windows={"bad": (3, 0x20)}, targets={})
         with self.assertRaisesRegex(ValueError, "target outside payload"):
             analyze_image(image, windows={}, targets={"bad": 0x200})
+
+
+    def test_cli_rejects_wrong_expected_sha256_before_inspection(self):
+        image = image_with_payload(bytes(0x40))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic-uboot.img"
+            path.write_bytes(image)
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+                status = main([str(path)])
+            self.assertEqual(status, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("differs from expected", json.loads(stderr.getvalue())["error"])
+            self.assertEqual(path.read_bytes(), image)
+
+    def test_cli_accepts_explicit_matching_hash_but_rejects_default_windows_on_short_image(self):
+        # A known hash alone is not enough: all analyst-selected code windows
+        # must be within the inspected, structurally valid payload.
+        image = image_with_payload(bytes(0x40))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic-uboot.img"
+            path.write_bytes(image)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = main([str(path), "--expected-sha256", hashlib.sha256(image).hexdigest()])
+            self.assertEqual(status, 2)
+            self.assertIn("bounded code window", json.loads(stderr.getvalue())["error"])
+            self.assertEqual(path.read_bytes(), image)
+
+    def test_rejects_mutated_payload_with_stale_dhtb_hash(self):
+        payload = bytes(0x100)
+        image = bytearray(image_with_payload(payload))
+        image[0x220] ^= 1
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            analyze_image(bytes(image), windows={"bounded": (0, 0x10)}, targets={})
+
+    def test_rejects_window_exceeding_fixed_budget(self):
+        payload = bytes(0x5000)
+        image = image_with_payload(payload)
+        with self.assertRaisesRegex(ValueError, "invalid bounded code window"):
+            analyze_image(image, windows={"oversize": (0, 0x4004)}, targets={})
 
 
 if __name__ == "__main__":
